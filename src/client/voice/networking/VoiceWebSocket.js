@@ -3,6 +3,7 @@
 const EventEmitter = require('events');
 const { setTimeout, setInterval } = require('node:timers');
 const WebSocket = require('../../../WebSocket');
+const RawWebSocket = require('ws');
 const { Error } = require('../../../errors');
 const { Opcodes, VoiceOpcodes } = require('../../../util/Constants');
 
@@ -53,7 +54,7 @@ class VoiceWebSocket extends EventEmitter {
   reset() {
     this.emit('debug', `[WS] reset requested`);
     if (this.ws) {
-      if (this.ws.readyState !== WebSocket.CLOSED) this.ws.close();
+      if (this.ws.readyState !== RawWebSocket.CLOSED) this.ws.close();
       this.ws = null;
     }
     this.clearHeartbeat();
@@ -77,7 +78,9 @@ class VoiceWebSocket extends EventEmitter {
      * The actual WebSocket used to connect to the Voice WebSocket Server.
      * @type {WebSocket}
      */
-    this.ws = WebSocket.create(`wss://${this.connection.authentication.endpoint}/`, { v: 8 });
+    // Use raw WebSocket — NOT WebSocket.create() — to avoid appending
+    // '&encoding=json' which the voice gateway v8 does not accept.
+    this.ws = new RawWebSocket(`wss://${this.connection.authentication.endpoint}/?v=9`);
     this.emit('debug', `[WS] connecting, ${this.attempts} attempts, ${this.ws.url}`);
     this.ws.onopen = this.onOpen.bind(this);
     this.ws.onmessage = this.onMessage.bind(this);
@@ -93,7 +96,7 @@ class VoiceWebSocket extends EventEmitter {
   send(data) {
     this.emit('debug', `[WS] >> ${data}`);
     return new Promise((resolve, reject) => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('WS_NOT_OPEN', data);
+      if (!this.ws || this.ws.readyState !== RawWebSocket.OPEN) throw new Error('WS_NOT_OPEN', data);
       this.ws.send(data, null, error => {
         if (error) reject(error);
         else resolve(data);
@@ -112,19 +115,44 @@ class VoiceWebSocket extends EventEmitter {
   }
 
   /**
+   * Sends a binary DAVE frame: [op:u8][payload bytes].
+   * Client-sent DAVE opcodes (23, 26, 28, 31) use this format.
+   * @param {number} op The opcode byte
+   * @param {Buffer} payload The raw payload bytes
+   * @returns {Promise<void>}
+   */
+  sendBinaryPacket(op, payload) {
+    const buf = Buffer.allocUnsafe(1 + payload.length);
+    buf.writeUInt8(op, 0);
+    payload.copy(buf, 1);
+    this.emit('debug', `[WS] >> binary op=${op} len=${buf.length}`);
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== RawWebSocket.OPEN) throw new Error('WS_NOT_OPEN');
+      this.ws.send(buf, { binary: true }, error => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
+  /**
    * Called whenever the WebSocket opens.
    */
   onOpen() {
-    this.emit('debug', `[WS] opened at gateway ${this.connection.authentication.endpoint}`);
+    // Use the snapshotted credentials from the moment checkAuthenticated() fired.
+    // Reading authentication live risks using a session_id overwritten by a late
+    // VOICE_STATE_UPDATE that arrived after the token was already issued.
+    const creds = this.connection._identifySnapshot || this.connection.authentication;
+    this.emit('debug', `[WS] opened at gateway ${creds.endpoint}`);
     this.sendPacket({
       op: Opcodes.DISPATCH,
       d: {
         server_id: this.connection.serverId || this.connection.channel.guild?.id || this.connection.channel.id,
         user_id: this.client.user.id,
-        token: this.connection.authentication.token,
-        session_id: this.connection.authentication.sessionId,
-        streams: [{ type: 'screen', rid: '100', quality: 100 }],
-        video: true,
+        token: creds.token,
+        session_id: creds.sessionId,
+        max_dave_protocol_version: 1,
+        seq_ack: -1,
       },
     }).catch(() => {
       this.emit('error', new Error('VOICE_JOIN_SOCKET_CLOSED'));
@@ -137,8 +165,22 @@ class VoiceWebSocket extends EventEmitter {
    * @returns {void}
    */
   onMessage(event) {
+    const data = event.data;
+    // Binary frames carry DAVE MLS payloads: [seq:u16be][op:u8][payload...]
+    if (data instanceof Buffer || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      try {
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        if (buf.length < 3) return;
+        this._sequenceNumber = buf.readUInt16BE(0);
+        const op = buf.readUInt8(2);
+        const payload = buf.slice(3);
+        return this.onPacket({ op, d: payload });
+      } catch (error) {
+        return this.onError(error);
+      }
+    }
     try {
-      return this.onPacket(WebSocket.unpack(event.data, 'json'));
+      return this.onPacket(WebSocket.unpack(data, 'json'));
     } catch (error) {
       return this.onError(error);
     }
@@ -150,6 +192,14 @@ class VoiceWebSocket extends EventEmitter {
    */
   onClose(event) {
     this.emit('debug', `[WS] closed with code ${event.code} and reason: ${event.reason}`);
+    // Non-recoverable close codes — retrying with the same credentials will
+    // always fail.  Emit a fatal error so VoiceConnection can surface it.
+    const FATAL_CODES = new Set([4004, 4006, 4009, 4011, 4014, 4016]);
+    if (FATAL_CODES.has(event.code)) {
+      this.dead = true;
+      this.emit('error', Object.assign(new Error(`Voice WS closed: ${event.code} ${event.reason}`), { code: event.code }));
+      return;
+    }
     if (!this.dead) setTimeout(this.connect.bind(this), this.attempts * 1000).unref();
   }
 
@@ -221,6 +271,27 @@ class VoiceWebSocket extends EventEmitter {
          * @event VoiceWebSocket#startStreaming
          */
         this.emit('startStreaming', packet.d);
+        break;
+      case VoiceOpcodes.DAVE_PREPARE_TRANSITION:
+        this.emit('davePrepareTransition', packet.d);
+        break;
+      case VoiceOpcodes.DAVE_EXECUTE_TRANSITION:
+        this.emit('daveExecuteTransition', packet.d);
+        break;
+      case VoiceOpcodes.DAVE_PREPARE_EPOCH:
+        this.emit('davePrepareEpoch', packet.d);
+        break;
+      case VoiceOpcodes.DAVE_MLS_EXTERNAL_SENDER:
+        this.emit('daveMlsExternalSender', packet.d);
+        break;
+      case VoiceOpcodes.DAVE_MLS_PROPOSALS:
+        this.emit('daveMlsProposals', packet.d);
+        break;
+      case VoiceOpcodes.DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION:
+        this.emit('daveMlsAnnounceCommitTransition', packet.d);
+        break;
+      case VoiceOpcodes.DAVE_MLS_WELCOME:
+        this.emit('daveMlsWelcome', packet.d);
         break;
       default:
         /**

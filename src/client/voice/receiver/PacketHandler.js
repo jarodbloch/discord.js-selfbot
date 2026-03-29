@@ -129,6 +129,26 @@ class PacketHandler extends EventEmitter {
     }
     */
 
+    // DAVE frame decryption: unwrap per-sender E2EE layer after RTP transport decryption.
+    const vc = this.receiver.connection;
+    const daveSession = vc.daveSession;
+    if (daveSession && !packet.equals(SILENCE_FRAME)) {
+      const ssrc = buffer.readUInt32BE(8);
+      const userStat = vc.ssrcMap.get(ssrc) || vc.ssrcMap.get(ssrc - 1);
+      if (userStat?.userId) {
+        try {
+          const davey = require('@snazzah/davey');
+          const MediaType = davey.MediaType ?? davey.Davey?.MediaType;
+          const daveReady = vc.daveProtocolVersion > 0 && daveSession.ready;
+          const canDecrypt = daveReady || (daveSession.ready && daveSession.canPassthrough(userStat.userId));
+          if (canDecrypt) {
+            packet = Buffer.from(daveSession.decrypt(userStat.userId, MediaType?.AUDIO ?? 0, packet));
+          }
+        } catch {
+          // Per-packet decryption failures are non-fatal
+        }
+      }
+    }
     return RtpPacket.deSerialize(Buffer.concat([header, packet]));
   }
 

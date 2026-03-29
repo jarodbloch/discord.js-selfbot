@@ -115,6 +115,12 @@ class ClientVoiceManager {
         resolve(connection);
         return;
       } else {
+        // Remove any stale @discordjs/voice adapter for this channel.
+        // If one exists it will race with the built-in voice system for the
+        // same session_id, causing Discord to invalidate one of them (4006).
+        this.adapters.delete(channel.id);
+        this.adapters.delete(channel.guild?.id);
+
         connection = new VoiceConnection(this, channel);
         if (config?.videoCodec) connection.setVideoCodec(config.videoCodec);
         connection.on('debug', msg =>

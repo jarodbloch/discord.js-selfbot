@@ -87,6 +87,33 @@ class VoiceConnection extends EventEmitter {
     this.authentication = {};
 
     /**
+     * The active DAVE (E2EE) session, if DAVE is negotiated.
+     * @type {?object}
+     * @private
+     */
+    this.daveSession = null;
+
+    /**
+     * The negotiated DAVE protocol version (0 = transport-only, 1 = E2EE).
+     * @type {number}
+     */
+    this.daveProtocolVersion = 0;
+
+    /**
+     * Pending DAVE transitions: Map<transitionId, protocolVersion>
+     * @type {Map<number, number>}
+     * @private
+     */
+    this._davePendingTransitions = new Map();
+
+    /**
+     * @deprecated use _davePendingTransitions
+     * @type {?number}
+     * @private
+     */
+    this._davePendingTransitionId = null;
+
+    /**
      * The audio player for this voice connection
      * @type {MediaPlayer}
      */
@@ -298,6 +325,7 @@ class VoiceConnection extends EventEmitter {
    * @private
    */
   sendVoiceStateUpdate(options = {}) {
+    const isDM = ['DM', 'GROUP_DM'].includes(this.channel.type);
     options = Util.mergeDefault(
       {
         guild_id: this.channel.guild?.id || null,
@@ -305,7 +333,9 @@ class VoiceConnection extends EventEmitter {
         self_mute: this.voice ? this.voice.selfMute : false,
         self_deaf: this.voice ? this.voice.selfDeaf : false,
         self_video: this.voice ? this.voice.selfVideo : false,
-        flags: 2,
+        // flags: 2 marks the session as an embedded activity — wrong for plain
+        // audio/video calls and causes the voice session to be invalidated (4006).
+        flags: isDM ? 0 : 2,
       },
       options,
     );
@@ -337,7 +367,7 @@ class VoiceConnection extends EventEmitter {
       return;
     }
 
-    endpoint = endpoint.match(/([^:]*)/)[0];
+    endpoint = endpoint.replace(/\/$/, '');
     this.emit('debug', `Endpoint resolved as ${endpoint}`);
 
     if (!endpoint) {
@@ -389,6 +419,9 @@ class VoiceConnection extends EventEmitter {
     this.emit('debug', `Authenticated with sessionId ${sessionId}`);
     if (token && endpoint && sessionId) {
       this.status = VoiceStatus.CONNECTING;
+      // Snapshot credentials now — subsequent VOICE_STATE_UPDATEs must not
+      // overwrite authentication.sessionId while the WS is mid-handshake.
+      this._identifySnapshot = { token, endpoint, sessionId };
       /**
        * Emitted when we successfully initiate a voice connection.
        * @event VoiceConnection#authenticated
@@ -546,8 +579,200 @@ class VoiceConnection extends EventEmitter {
     ws.on('startSpeaking', this.onStartSpeaking.bind(this));
     ws.on('startStreaming', this.onStartStreaming.bind(this));
 
+    // DAVE E2EE handlers — session is init'd in onSessionDescription after dave_protocol_version is known
+    ws.on('davePrepareTransition', this._onDavePrepareTransition.bind(this));
+    ws.on('davePrepareEpoch', this._onDavePrepareEpoch.bind(this));
+    ws.on('daveExecuteTransition', this._onDaveExecuteTransition.bind(this));
+    ws.on('daveMlsExternalSender', this._onDaveMlsExternalSender.bind(this));
+    ws.on('daveMlsProposals', this._onDaveMlsProposals.bind(this));
+    ws.on('daveMlsAnnounceCommitTransition', this._onDaveMlsAnnounceCommitTransition.bind(this));
+    ws.on('daveMlsWelcome', this._onDaveMlsWelcome.bind(this));
+
     this.sockets.ws.connect();
   }
+
+  // ─── DAVE E2EE ────────────────────────────────────────────────────────────
+
+  /**
+   * Creates or reinitialises the DAVE session for the given protocol version.
+   * Called from onSessionDescription after dave_protocol_version is known.
+   * @param {number} version
+   * @private
+   */
+  _reinitDaveSession(version) {
+    this.daveProtocolVersion = version;
+    if (version > 0) {
+      let DAVESession;
+      try {
+        ({ DAVESession } = require('@snazzah/davey'));
+      } catch {
+        this.emit('debug', '[DAVE] @snazzah/davey not found — audio will be inaudible');
+        return;
+      }
+      const channelId = this.serverId || this.channel.guild?.id || this.channel.id;
+      if (this.daveSession) {
+        this.daveSession.reinit(version, this.client.user.id, channelId);
+        this.emit('debug', `[DAVE] session reinitialized for protocol version ${version}`);
+      } else {
+        this.daveSession = new DAVESession(version, this.client.user.id, channelId);
+        this.emit('debug', `[DAVE] session initialized for protocol version ${version}`);
+      }
+      // Send key package immediately after init, per USAGE.md
+      const keyPackage = Buffer.from(this.daveSession.getSerializedKeyPackage());
+      this.sockets.ws?.sendBinaryPacket(VoiceOpcodes.DAVE_MLS_KEY_PACKAGE, keyPackage)
+        .catch(e => this.emit('debug', `[DAVE] key_package send failed: ${e}`));
+    } else {
+      // Downgraded to transport-only
+      if (this.daveSession) {
+        this.daveSession.reset();
+        this.daveSession.setPassthroughMode(true, 10);
+        this.emit('debug', '[DAVE] session reset (transport-only)');
+      }
+    }
+  }
+
+  /** @private */
+  _executePendingTransition(transitionId) {
+    if (!this._davePendingTransitions.has(transitionId)) {
+      this.emit('debug', `[DAVE] execute transition ${transitionId} not in pending set`);
+      return;
+    }
+    const oldVersion = this.daveProtocolVersion;
+    const newVersion = this._davePendingTransitions.get(transitionId);
+    this.daveProtocolVersion = newVersion;
+    if (oldVersion !== newVersion && newVersion === 0) {
+      this.emit('debug', '[DAVE] protocol downgraded to transport-only');
+    } else if (transitionId > 0 && oldVersion === 0 && newVersion > 0) {
+      this.daveSession?.setPassthroughMode(true, 10);
+      this.emit('debug', '[DAVE] protocol upgraded from transport-only');
+    }
+    this.emit('debug', `[DAVE] transition executed (v${oldVersion} → v${newVersion}, id: ${transitionId})`);
+    this._davePendingTransitions.delete(transitionId);
+  }
+
+  /** op 21 – @private */
+  _onDavePrepareTransition(d) {
+    // d is a JSON packet (non-binary)
+    const transitionId = d?.transition_id ?? 0;
+    const protocolVersion = d?.protocol_version ?? 0;
+    this.emit('debug', `[DAVE] prepare transition (id: ${transitionId}, v${protocolVersion})`);
+    this._davePendingTransitions.set(transitionId, protocolVersion);
+    if (transitionId === 0) {
+      this._executePendingTransition(transitionId);
+    } else {
+      if (protocolVersion === 0) {
+        this.daveSession?.setPassthroughMode(true, 120);
+      }
+      this.sockets.ws?.sendPacket({
+        op: VoiceOpcodes.DAVE_TRANSITION_READY,
+        d: { transition_id: transitionId },
+      }).catch(e => this.emit('debug', `[DAVE] transition_ready send failed: ${e}`));
+    }
+  }
+
+  /** op 22 – @private */
+  _onDaveExecuteTransition(d) {
+    const transitionId = d?.transition_id ?? 0;
+    this.emit('debug', `[DAVE] execute transition (id: ${transitionId})`);
+    this._executePendingTransition(transitionId);
+  }
+
+  /** op 24 – @private */
+  _onDavePrepareEpoch(d) {
+    this.emit('debug', `[DAVE] prepare epoch (epoch: ${d?.epoch}, v${d?.protocol_version})`);
+    if (d?.epoch === 1) {
+      this._reinitDaveSession(d?.protocol_version ?? 1);
+    }
+  }
+
+  /** op 25 – @private */
+  _onDaveMlsExternalSender(data) {
+    if (!this.daveSession) return;
+    try {
+      this.daveSession.setExternalSender(Buffer.isBuffer(data) ? data : Buffer.from(data));
+      this.emit('debug', '[DAVE] external sender set');
+    } catch (e) {
+      this.emit('debug', `[DAVE] external_sender error: ${e}`);
+    }
+  }
+
+  /** op 27 – @private */
+  _onDaveMlsProposals(data) {
+    if (!this.daveSession) return;
+    try {
+      // Binary payload (after seq+op stripped by onMessage): [optype:u8][proposals...]
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      const optype = buf.readUInt8(0);
+      const raw = buf.slice(1);
+      const recognizedUserIds = [...this.ssrcMap.values()].map(v => v.userId).filter(Boolean);
+      const { commit, welcome } = this.daveSession.processProposals(optype, raw, recognizedUserIds);
+      if (commit) {
+        const out = welcome ? Buffer.concat([Buffer.from(commit), Buffer.from(welcome)]) : Buffer.from(commit);
+        this.sockets.ws?.sendBinaryPacket(VoiceOpcodes.DAVE_MLS_COMMIT_WELCOME, out)
+          .catch(e => this.emit('debug', `[DAVE] commit_welcome send failed: ${e}`));
+      }
+    } catch (e) {
+      this.emit('debug', `[DAVE] proposals error: ${e}`);
+    }
+  }
+
+  /** op 29 – @private */
+  _onDaveMlsAnnounceCommitTransition(data) {
+    if (!this.daveSession) return;
+    // Binary payload: [transition_id:u16be][MLSMessage commit...]
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const transitionId = buf.length >= 2 ? buf.readUInt16BE(0) : 0;
+    const commitBytes = buf.slice(2);
+    try {
+      this.daveSession.processCommit(commitBytes);
+      this.emit('debug', `[DAVE] commit processed (transition id: ${transitionId})`);
+      if (transitionId !== 0) {
+        this._davePendingTransitions.set(transitionId, this.daveProtocolVersion);
+        this.sockets.ws?.sendPacket({
+          op: VoiceOpcodes.DAVE_TRANSITION_READY,
+          d: { transition_id: transitionId },
+        }).catch(e => this.emit('debug', `[DAVE] transition_ready send failed: ${e}`));
+      }
+    } catch (e) {
+      this.emit('debug', `[DAVE] commit error: ${e}`);
+      this._recoverFromInvalidCommit(transitionId);
+    }
+  }
+
+  /** op 30 – @private */
+  _onDaveMlsWelcome(data) {
+    if (!this.daveSession) return;
+    // Binary payload: [transition_id:u16be][Welcome message...]
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const transitionId = buf.length >= 2 ? buf.readUInt16BE(0) : 0;
+    const welcomeBytes = buf.slice(2);
+    try {
+      this.daveSession.processWelcome(welcomeBytes);
+      this.emit('debug', `[DAVE] welcome processed (transition id: ${transitionId})`);
+      if (transitionId !== 0) {
+        this._davePendingTransitions.set(transitionId, this.daveProtocolVersion);
+        this.sockets.ws?.sendPacket({
+          op: VoiceOpcodes.DAVE_TRANSITION_READY,
+          d: { transition_id: transitionId },
+        }).catch(e => this.emit('debug', `[DAVE] transition_ready send failed: ${e}`));
+      }
+    } catch (e) {
+      this.emit('debug', `[DAVE] welcome error: ${e}`);
+      this._recoverFromInvalidCommit(transitionId);
+    }
+  }
+
+  /** @private */
+  _recoverFromInvalidCommit(transitionId) {
+    this.sockets.ws?.sendPacket({
+      op: VoiceOpcodes.DAVE_MLS_INVALID_COMMIT_WELCOME,
+      d: { transition_id: transitionId },
+    }).catch(() => {});
+    const channelId = this.serverId || this.channel.guild?.id || this.channel.id;
+    this._reinitDaveSession(this.daveProtocolVersion);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
 
   /**
    * Invoked when the voice websocket is ready.
@@ -574,6 +799,11 @@ class VoiceConnection extends EventEmitter {
   onSessionDescription(data) {
     Object.assign(this.authentication, data);
     this.status = VoiceStatus.CONNECTED;
+
+    // Reinit DAVE session with the protocol version the voice server chose.
+    // Per USAGE.md, this is the correct place to init/reinit and send the key package.
+    const negotiatedVersion = data.dave_protocol_version ?? 0;
+    this._reinitDaveSession(negotiatedVersion);
     const ready = () => {
       clearTimeout(this.connectTimeout);
       this.emit('debug', `Ready with authentication details: ${JSON.stringify(this.authentication)}`);

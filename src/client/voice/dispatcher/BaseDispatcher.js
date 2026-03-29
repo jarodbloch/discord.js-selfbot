@@ -389,6 +389,17 @@ class BaseDispatcher extends Writable {
       8,
       4,
     );
+    // DAVE frame-level encryption (must happen before RTP transport encryption).
+    // Only encrypt audio opus frames when the DAVE session is ready and we're not in passthrough mode.
+    const vc = this.player.voiceConnection;
+    const daveReady = vc.daveProtocolVersion > 0 && vc.daveSession?.ready;
+    if (daveReady && this.getTypeDispatcher() === 'audio') {
+      try {
+        buffer = vc.daveSession.encryptOpus(buffer);
+      } catch (e) {
+        this.emit('debug', `[DAVE] encryptOpus failed: ${e}`);
+      }
+    }
     return Buffer.concat([rtpHeader, ...this._encrypt(buffer, rtpHeader)]);
   }
 

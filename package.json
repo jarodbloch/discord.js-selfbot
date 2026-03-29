@@ -70,6 +70,9 @@
   "engines": {
     "node": ">=20.18"
   },
+  "optionalDependencies": {
+    "@snazzah/davey": "^0.1.10"
+  },
   "devDependencies": {
     "@discordjs/docgen": "^0.11.1",
     "@types/debug": "^4.1.12",

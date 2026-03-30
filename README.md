@@ -1,9 +1,4 @@
-> [!IMPORTANT]
-> ## Project Archival
-> 
-> **This project is no longer actively maintained and this repository has been archived.**
->
-> You can read the full announcement [here](https://github.com/aiko-chan-ai/discord.js-selfbot-v13/discussions/1743)
+This project is being somewhat maintained by me whenever I would need to update it for my own purposes. No promises on updating it in a timely manner though.
 
 <div align="center">
   <br />

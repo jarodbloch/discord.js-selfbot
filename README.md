@@ -1,9 +1,4 @@
-> [!IMPORTANT]
-> ## Project Archival
-> 
-> **This project is no longer actively maintained and this repository has been archived.**
->
-> You can read the full announcement [here](https://github.com/aiko-chan-ai/discord.js-selfbot-v13/discussions/1743)
+This project is being somewhat maintained by me whenever I would need to update it for my own purposes. No promises on updating it in a timely manner though.
 
 <div align="center">
   <br />
@@ -114,11 +109,7 @@ Github Discussion: [Here](https://github.com/aiko-chan-ai/discord.js-selfbot-v13
 ## Credits
 - [Discord.js](https://github.com/discordjs/discord.js)
 
-## <strong>Other project(s)
+## <strong>Other project(s) \[original maintainer\]
 
 - 📘 [***aiko-chan-ai/DiscordBotClient***](https://github.com/aiko-chan-ai/DiscordBotClient) <br/>
   A patched version of discord, with bot login support
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=aiko-chan-ai/discord.js-selfbot-v13&type=Date)](https://star-history.com/#aiko-chan-ai/discord.js-selfbot-v13&Date)
